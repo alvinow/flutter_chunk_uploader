@@ -61,11 +61,13 @@ class UploadProgress {
 class ChunkedFileUploader {
   final String serverUrl;
   final Dio _dio;
-  final int chunkSize;
+  int chunkSize;
 
   String? _uploadId;
   bool _isPaused = false;
   bool _isCancelled = false;
+  int _retryCount = 0;
+  static const int _maxRetries = 3;
 
   final StreamController<UploadProgress> _progressController =
   StreamController<UploadProgress>.broadcast();
@@ -74,16 +76,17 @@ class ChunkedFileUploader {
 
   ChunkedFileUploader({
     required this.serverUrl,
-    this.chunkSize = 1024 * 1024, // 1MB default chunk size
+    int? chunkSize,
     int connectionTimeout = 30000,
     int receiveTimeout = 30000,
-  }) : _dio = Dio(
-    BaseOptions(
-      baseUrl: serverUrl,
-      connectTimeout: Duration(milliseconds: connectionTimeout),
-      receiveTimeout: Duration(milliseconds: receiveTimeout),
-    ),
-  );
+  }) : chunkSize = chunkSize ?? (5 * 1024 * 1024), // 5MB default (optimized)
+        _dio = Dio(
+          BaseOptions(
+            baseUrl: serverUrl,
+            connectTimeout: Duration(milliseconds: connectionTimeout),
+            receiveTimeout: Duration(milliseconds: receiveTimeout),
+          ),
+        );
 
   /// Upload a file from bytes (works on web and mobile)
   Future<String?> uploadFileFromBytes(
@@ -354,73 +357,93 @@ class ChunkedFileUploader {
     }
   }
 
-  /// Upload a single chunk from File
+  /// Upload a single chunk from File with retry logic
   Future<bool> _uploadChunk(
       File file,
       int chunkNumber,
       int totalChunks,
       int fileSize,
       ) async {
-    try {
-      final start = chunkNumber * chunkSize;
-      final end = (start + chunkSize < fileSize) ? start + chunkSize : fileSize;
+    _retryCount = 0;
+    while (_retryCount < _maxRetries) {
+      try {
+        final start = chunkNumber * chunkSize;
+        final end = (start + chunkSize < fileSize) ? start + chunkSize : fileSize;
 
-      final chunk = await file.openRead(start, end).toList();
-      final chunkBytes = chunk.expand((x) => x).toList();
+        final chunk = await file.openRead(start, end).toList();
+        final chunkBytes = chunk.expand((x) => x).toList();
 
-      final formData = FormData.fromMap({
-        'chunk': MultipartFile.fromBytes(
-          chunkBytes,
-          filename: 'chunk',
-        ),
-        'uploadId': _uploadId,
-        'chunkNumber': chunkNumber.toString(),
-      });
+        final formData = FormData.fromMap({
+          'chunk': MultipartFile.fromBytes(
+            chunkBytes,
+            filename: 'chunk',
+          ),
+          'uploadId': _uploadId,
+          'chunkNumber': chunkNumber.toString(),
+        });
 
-      final response = await _dio.post(
-        '/upload/chunk',
-        data: formData,
-      );
+        final response = await _dio.post(
+          '/upload/chunk',
+          data: formData,
+        );
 
-      return response.statusCode == 200;
-    } catch (e) {
-      print('Upload chunk error: $e');
-      return false;
+        _retryCount = 0; // Reset on success
+        return response.statusCode == 200;
+      } catch (e) {
+        _retryCount++;
+        if (_retryCount >= _maxRetries) {
+          print('Failed to upload chunk $chunkNumber after $_maxRetries retries: $e');
+          return false;
+        }
+        // Exponential backoff: wait 1s, 2s, 4s
+        await Future.delayed(Duration(seconds: 1 << (_retryCount - 1)));
+      }
     }
+    return false;
   }
 
-  /// Upload a single chunk from bytes
+  /// Upload a single chunk from bytes with retry logic
   Future<bool> _uploadChunkFromBytes(
       Uint8List bytes,
       int chunkNumber,
       int totalChunks,
       int fileSize,
       ) async {
-    try {
-      final start = chunkNumber * chunkSize;
-      final end = (start + chunkSize < fileSize) ? start + chunkSize : fileSize;
+    _retryCount = 0;
+    while (_retryCount < _maxRetries) {
+      try {
+        final start = chunkNumber * chunkSize;
+        final end = (start + chunkSize < fileSize) ? start + chunkSize : fileSize;
 
-      final chunkBytes = bytes.sublist(start, end);
+        final chunkBytes = bytes.sublist(start, end);
 
-      final formData = FormData.fromMap({
-        'chunk': MultipartFile.fromBytes(
-          chunkBytes,
-          filename: 'chunk',
-        ),
-        'uploadId': _uploadId,
-        'chunkNumber': chunkNumber.toString(),
-      });
+        final formData = FormData.fromMap({
+          'chunk': MultipartFile.fromBytes(
+            chunkBytes,
+            filename: 'chunk',
+          ),
+          'uploadId': _uploadId,
+          'chunkNumber': chunkNumber.toString(),
+        });
 
-      final response = await _dio.post(
-        '/upload/chunk',
-        data: formData,
-      );
+        final response = await _dio.post(
+          '/upload/chunk',
+          data: formData,
+        );
 
-      return response.statusCode == 200;
-    } catch (e) {
-      print('Upload chunk error: $e');
-      return false;
+        _retryCount = 0; // Reset on success
+        return response.statusCode == 200;
+      } catch (e) {
+        _retryCount++;
+        if (_retryCount >= _maxRetries) {
+          print('Failed to upload chunk $chunkNumber after $_maxRetries retries: $e');
+          return false;
+        }
+        // Exponential backoff: wait 1s, 2s, 4s
+        await Future.delayed(Duration(seconds: 1 << (_retryCount - 1)));
+      }
     }
+    return false;
   }
 
   /// Complete upload and merge chunks
